@@ -31,31 +31,19 @@ public class CalculateAverage_truelive {
     private static final String FILE = "./measurements.txt";
     private static final long CHUNK_SIZE = 1024 * 1024 * 10L;
 
-    private static int branchlessParseInt(final byte[] input, final int length) {
-        // 0 if positive, 1 if negative
-        final int negative = ~(input[0] >> 4) & 1;
-        // 0 if nr length is 3, 1 if length is 4
-        final int has4 = ((length - negative) >> 2) & 1;
-
-        final int digit1 = input[negative] - '0';
-        final int digit2 = input[negative + has4] - '0';
-        final int digit3 = input[2 + negative + has4] - '0';
-
-        return (-negative ^ (has4 * (digit1 * 100) + digit2 * 10 + digit3) - negative);
-    }
-
-    // branchless max (unprecise for large numbers, but good enough)
-    static int max(final int a, final int b) {
-        final int diff = a - b;
-        final int dsgn = diff >> 31;
-        return a - (diff & dsgn);
-    }
-
-    // branchless min (unprecise for large numbers, but good enough)
-    static int min(final int a, final int b) {
-        final int diff = a - b;
-        final int dsgn = diff >> 31;
-        return b + (diff & dsgn);
+    private static double getDouble(byte[] arr) {
+        int pos = 0;
+        final int negative = ~(arr[pos] >> 4) & 1;
+        int sig = 1;
+        sig -= 2*negative;
+        pos+=negative;
+        int digit1 = arr[pos] - '0';
+        pos++;
+        if (arr[pos] == '.') {
+            return sig*(digit1 + (arr[pos + 1] - '0') / 10.0);
+        } else {
+            return sig*(digit1 * 10 + (arr[pos] - '0') + (arr[pos + 2] - '0') / 10.0);
+        }
     }
 
     private record Measurement(DoubleAccumulator min, DoubleAccumulator max, DoubleAccumulator sum, LongAdder count) {
@@ -175,29 +163,21 @@ public class CalculateAverage_truelive {
 
     private static Map<String, Measurement> parseBuffer(final ByteBuffer bug) {
 
-        final Map<String, Measurement> resultMap = new HashMap<>();
+        final Map<String, Measurement> resultMap = new HashMap<>(500);
         bug.mark();
         String name = null;
         final byte[] arr = new byte[128];
+        int cur = 0;
         while (bug.hasRemaining()) {
             final char c = (char) bug.get();
+            arr[cur++]= (byte) c;
             if (c == ';') {
-                final int pos = bug.position();
-                bug.reset();
-                final int len = pos - bug.position() - 1;
-                bug.get(bug.position(), arr, 0, len);
-                name = new String(arr, 0, len);
-                bug.position(pos);
-                bug.mark();
+                name = new String(arr, 0, cur-1);
+                cur = 0;
             } else if (c == '\n') {
-                final int pos = bug.position();
-                bug.reset();
-                final int len = pos - bug.position();
-                bug.get(bug.position(), arr, 0, len);
-                final double temp = Double.parseDouble(new String(arr, 0, len));
+                final double temp = getDouble(arr);
                 resultMap.compute(name, (k, v) -> (v == null) ? Measurement.of(temp) : v.add(temp));
-                bug.position(pos);
-                bug.mark();
+                cur=0;
             }
         }
         return resultMap;
