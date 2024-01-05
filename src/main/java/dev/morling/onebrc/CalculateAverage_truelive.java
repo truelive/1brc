@@ -15,12 +15,17 @@
  */
 package dev.morling.onebrc;
 
+import jdk.incubator.vector.DoubleVector;
+
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.DoubleAccumulator;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
@@ -31,8 +36,58 @@ public class CalculateAverage_truelive {
     private static final String FILE = "./measurements.txt";
     private static final long CHUNK_SIZE = 1024 * 1024 * 10L;
 
-    private static double getDouble(byte[] arr) {
-        int pos = 0;
+    private static final Map<DankString, DankString> dankPool = new ConcurrentHashMap<>(500);
+
+    static class DankString implements Comparable<DankString> {
+        private final byte[] array;
+        private final int hcode;
+
+        public DankString(byte[] arr, int start, int len, int hash) {
+            this.array = Arrays.copyOfRange(arr, start, len);
+            this.hcode = hash;
+        }
+
+        public static DankString of(byte[] arr, int start, int len, int hash) {
+            return new DankString(arr, start, len, hash);
+        }
+
+
+        @Override
+        public int hashCode() {
+            return this.hcode;
+        }
+
+
+        @Override
+        public String toString() {
+            return new String(this.array);
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            final DankString that = (DankString) o;
+            return Arrays.equals(array, that.array);
+        }
+
+        @Override
+        public int compareTo(DankString o) {
+            if (this == o) {
+                return 0;
+            }
+            if (o == null) {
+                return 1;
+            }
+            return Arrays.compare(this.array, o.array);
+        }
+    }
+
+    private static double getDouble(byte[] arr, int pos) {
         final int negative = ~(arr[pos] >> 4) & 1;
         int sig = 1;
         sig -= 2*negative;
@@ -46,9 +101,24 @@ public class CalculateAverage_truelive {
         }
     }
 
-    private record Measurement(DoubleAccumulator min, DoubleAccumulator max, DoubleAccumulator sum, LongAdder count) {
-        public static Measurement of(final Double initialMeasurement) {
-            final Measurement measurement = new Measurement(
+    private interface Measurement {
+        static Measurement of(DankString keyValue, double temp) {
+            return MeasurementA.of(keyValue, temp);
+        }
+
+        public DankString getKey();
+        public double getMin();
+        public double getMax();
+        public double getSum();
+        public long getCount();
+        public Measurement add(final double measurment);
+        public Measurement combineWith(final Measurement m) ;
+    }
+
+    private record MeasurementA(DankString key, DoubleAccumulator min, DoubleAccumulator max, DoubleAccumulator sum, LongAdder count) implements Measurement{
+        public static Measurement of(DankString key, final Double initialMeasurement) {
+            final MeasurementA measurement = new MeasurementA(
+                    key,
                     new DoubleAccumulator(Math::min, initialMeasurement),
                     new DoubleAccumulator(Math::max, initialMeasurement),
                     new DoubleAccumulator(Double::sum, initialMeasurement),
@@ -58,6 +128,32 @@ public class CalculateAverage_truelive {
             return measurement;
         }
 
+        @Override
+        public DankString getKey() {
+            return key;
+        }
+
+        @Override
+        public double getMin() {
+            return min.doubleValue();
+        }
+
+        @Override
+        public double getMax() {
+            return max.doubleValue();
+        }
+
+        @Override
+        public double getSum() {
+            return sum.doubleValue();
+        }
+
+        @Override
+        public long getCount() {
+            return count.sum();
+        }
+
+        @Override
         public Measurement add(final double measurment) {
             min.accumulate(measurment);
             max.accumulate(measurment);
@@ -78,30 +174,214 @@ public class CalculateAverage_truelive {
             return Math.round(value * 10.0) / 10.0;
         }
 
-        public static Measurement combineWith(final Measurement m1, final Measurement m2) {
-            m1.min.accumulate(m2.min.doubleValue());
-            m1.max.accumulate(m2.max.doubleValue());
-            m1.sum.accumulate(m2.sum.doubleValue());
-            m1.count.add(m2.count.sum());
-            return new Measurement(
+        @Override
+        public Measurement combineWith(final Measurement m) {
+            MeasurementA m1 = this;
+            if (!Objects.equals(m1.key, m.getKey())) {
+                throw new IllegalArgumentException("Merging Mismached entries "+new String(m1.key.array)+" != "+ new String(m.getKey().array));
+            }
+            m1.min.accumulate(m.getMin());
+            m1.max.accumulate(m.getMax());
+            m1.sum.accumulate(m.getSum());
+            m1.count.add(m.getCount());
+            return new MeasurementA(
+                    m1.key,
                     m1.min,
                     m1.max,
                     m1.sum,
                     m1.count
             );
         }
+
     }
 
-    private static Map<String, Measurement> combineMaps(
-            final Map<String, Measurement> map1,
-            final Map<String, Measurement> map2
-    ) {
-        for (final var entry : map2.entrySet()) {
-            map1.merge(entry.getKey(), entry.getValue(), Measurement::combineWith);
+    static class MeasurementB implements Measurement{
+        DankString key; double min; double max; double sum; long count;
+
+        public MeasurementB(
+                DankString key,
+                Double min,
+                Double max,
+                Double sum,
+                long count
+        ) {
+            this.key = key;
+            this.max = max;
+            this.min = min;
+            this.sum = sum;
+            this.count = count;
         }
 
-        return map1;
+        public static Measurement of(DankString key, final Double initialMeasurement) {
+            final MeasurementB measurement = new MeasurementB(
+                    key,
+                    initialMeasurement,
+                    initialMeasurement,
+                    initialMeasurement,
+                    1
+            );
+            return measurement;
+        }
+
+        @Override
+        public DankString getKey() {
+            return key;
+        }
+
+        @Override
+        public double getMin() {
+            return min;
+        }
+
+        @Override
+        public double getMax() {
+            return max;
+        }
+
+        @Override
+        public double getSum() {
+            return sum;
+        }
+
+        @Override
+        public long getCount() {
+            return count;
+        }
+
+        @Override
+        public Measurement add(final double measurment) {
+            min = Math.min(min, measurment);
+            max = Math.max(max, measurment);
+            sum += measurment;
+            count++;
+            return this;
+        }
+
+        public String toString() {
+            return round(min) +
+                   "/" +
+                   round(sum/ count) +
+                   "/" +
+                   round(max);
+        }
+
+        private double round(final double value) {
+            return Math.round(value * 10.0) / 10.0;
+        }
+
+        @Override
+        public Measurement combineWith(final Measurement m) {
+            MeasurementB m1 = this;
+            if (!Objects.equals(m1.key, m.getKey())) {
+                throw new IllegalArgumentException("Merging Mismached entries "+new String(m1.key.array)+" != "+ new String(m.getKey().array));
+            }
+
+            return new MeasurementB(
+                    m1.key,
+                    m1.min + m.getMin(),
+                    m1.max + m.getMax(),
+                    m1.sum + m.getSum(),
+                    m1.count + m.getCount()
+            );
+        }
+
     }
+
+    static class MeasurementD implements Measurement{
+        DankString key; double min; double max; double sum; long count;
+
+        public MeasurementD(
+                DankString key,
+                Double min,
+                Double max,
+                Double sum,
+                long count
+        ) {
+            this.key = key;
+            this.max = max;
+            this.min = min;
+            this.sum = sum;
+            this.count = count;
+        }
+
+        public static Measurement of(DankString key, final Double initialMeasurement) {
+            ByteBuffer minBB = ByteBuffer.allocate(128);
+            MemorySegment ms = MemorySegment.ofBuffer(minBB);
+            DoubleVector minV = DoubleVector.fromMemorySegment(DoubleVector.SPECIES_128, ms,0, ByteOrder.nativeOrder());
+            final MeasurementB measurement = new MeasurementB(
+                    key,
+                    initialMeasurement,
+                    initialMeasurement,
+                    initialMeasurement,
+                    1
+            );
+            return measurement;
+        }
+
+        @Override
+        public DankString getKey() {
+            return key;
+        }
+
+        @Override
+        public double getMin() {
+            return min;
+        }
+
+        @Override
+        public double getMax() {
+            return max;
+        }
+
+        @Override
+        public double getSum() {
+            return sum;
+        }
+
+        @Override
+        public long getCount() {
+            return count;
+        }
+
+        @Override
+        public Measurement add(final double measurment) {
+            min = Math.min(min, measurment);
+            max = Math.max(max, measurment);
+            sum += measurment;
+            count++;
+            return this;
+        }
+
+        public String toString() {
+            return round(min) +
+                   "/" +
+                   round(sum/ count) +
+                   "/" +
+                   round(max);
+        }
+
+        private double round(final double value) {
+            return Math.round(value * 10.0) / 10.0;
+        }
+
+        @Override
+        public Measurement combineWith(final Measurement m) {
+            MeasurementD m1 = this;
+            if (!Objects.equals(m1.key, m.getKey())) {
+                throw new IllegalArgumentException("Merging Mismached entries "+new String(m1.key.array)+" != "+ new String(m.getKey().array));
+            }
+
+            return new MeasurementB(
+                    m1.key,
+                    m1.min + m.getMin(),
+                    m1.max + m.getMax(),
+                    m1.sum + m.getSum(),
+                    m1.count + m.getCount()
+            );
+        }
+
+    }
+
 
     public static void main(final String[] args) throws IOException {
         //long before = System.currentTimeMillis();
@@ -143,43 +423,74 @@ public class CalculateAverage_truelive {
         };
         final Map<String, Measurement> reduce = StreamSupport.stream(Spliterators.spliteratorUnknownSize(
                                                                iterator, Spliterator.IMMUTABLE), true)
-                                                             .parallel()
+                                                             //.parallel()
                                                              .map(CalculateAverage_truelive::parseBuffer)
-                                                             .reduce(CalculateAverage_truelive::combineMaps).get();
+                .flatMap((DankMap dankMap) -> dankMap.getAll().stream())
+                .collect(Collectors.toMap(k -> k.getKey().toString(), v->v, Measurement::combineWith, TreeMap::new));
 
         System.out.print("{");
         System.out.print(
                 reduce
-                        .entrySet()
-                        .stream()
-                        .sorted(Map.Entry.comparingByKey())
-                        .map(Object::toString)
-                        .collect(Collectors.joining(", ")));
+                       );
         System.out.println("}");
 
         //System.out.println("Took: " + (System.currentTimeMillis() - before));
 
     }
 
-    private static Map<String, Measurement> parseBuffer(final ByteBuffer bug) {
+    private static DankMap parseBuffer(final ByteBuffer bug) {
 
-        final Map<String, Measurement> resultMap = new HashMap<>(500);
+        final DankMap resultMap = new DankMap();
         bug.mark();
-        String name = null;
+        DankString name = null;
         final byte[] arr = new byte[128];
         int cur = 0;
+        int hash = 0;
         while (bug.hasRemaining()) {
-            final char c = (char) bug.get();
+            char c = (char) bug.get();
             arr[cur++]= (byte) c;
-            if (c == ';') {
-                name = new String(arr, 0, cur-1);
-                cur = 0;
-            } else if (c == '\n') {
-                final double temp = getDouble(arr);
-                resultMap.compute(name, (k, v) -> (v == null) ? Measurement.of(temp) : v.add(temp));
-                cur=0;
+            while (c != ';') {
+                hash += 31*hash + c;
+                c = (char) bug.get();
+                arr[cur++]= (byte) c;
             }
+            name = DankString.of(arr,0,cur-1, hash);
+            cur = 0;
+            hash = 0;
+            while (c != '\n') {
+                c = (char) bug.get();
+                arr[cur++]= (byte) c;
+            }
+            final double temp = getDouble(arr, 0);
+            resultMap.putOrDefault(name, temp);
+            cur = 0;
         }
         return resultMap;
+    }
+
+    static class  DankMap  {
+        private final static int MAP_SIZE = 1024*128;
+        private final Measurement[] values = new Measurement[MAP_SIZE];
+        private final DankString[] keys = new DankString[MAP_SIZE];
+
+        public void putOrDefault(DankString keyValue, double temp) {
+            int pos = keyValue.hcode & (values.length - 1);
+            final byte[] key = keyValue.array;
+            Measurement value = values[pos];
+            while (value != null && key.length != keys[pos].array.length && Arrays.equals(key, keys[pos].array)) {
+                pos = (pos + 1) & (values.length - 1);
+                value = values[pos];
+            }
+            if (value == null) {
+                keys[pos] = keyValue;
+                values[pos] = Measurement.of(keyValue, temp);
+            } else {
+                value.add(temp);
+            }
+        }
+
+        public List<Measurement> getAll() {
+            return Arrays.stream(values).filter(Objects::nonNull).toList();
+        }
     }
 }
